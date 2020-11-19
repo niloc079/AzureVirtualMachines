@@ -1,0 +1,266 @@
+[CmdletBinding()]
+
+Param(
+    [Parameter(Mandatory = $false)]
+    [String] $environment = "Production"
+    
+    [Parameter(Mandatory = $false)]
+    [String] $AzTagApplication = "[TagApp]"
+
+    [Parameter(Mandatory = $false)]
+    [String] $subscriptionName = "[AzSubName]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $tenantID = "[AzTenantID]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $rgName = "[AzureRG]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $locationName = "centralus",
+
+    [Parameter(Mandatory = $true)]
+    [String] $vmName,
+
+    [Parameter(Mandatory = $false)]
+    [String] $vmDescription = "Test",
+
+    [Parameter(Mandatory = $false)]
+    [String] $vmSku = "Standard_D1_v2",
+
+    [Parameter(Mandatory = $false)]
+    [String] $vmOS = "2012-R2-Datacenter",
+
+    [Parameter(Mandatory = $false)]
+    [int] $vmZone = 1,
+
+    [Parameter(Mandatory = $false)]
+    [String] $vmTimeZone = "Central Standard Time",
+
+    [Parameter(Mandatory = $false)]
+    [String] $vnetName = "[AzVnetName]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $vnetRGName = "[AzVnetRG]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $subnetName = "[AzVnetSubnet]",
+    [Parameter(Mandatory = $false)]
+    [String] $osDiskStorageType = "StandardSSD_LRS",
+
+    [Parameter(Mandatory = $false)]
+    [Int] $osDiskSize = 128,
+
+    [Parameter(Mandatory = $false)]
+    [String] $dataDisk1StorageType = "Premium_LRS",
+
+    [Parameter(Mandatory = $false)]
+    [Int] $dataDisk1SizeGB = 32,
+
+    [Parameter(Mandatory = $false)]
+    [String] $adeKeyVaultName = "[AzKeyVaultName]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $adeKeyVaultRGName = "[AzKeyVaultRG]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $adeKEKName = "ADEKEK",
+
+    [Parameter(Mandatory = $false)]
+    [String] $logAnalyticsWorkspaceID = "[AzLAWorkspaceID]",
+
+    [Parameter(Mandatory = $false)]
+    [String] $logAnalyticsWorkspaceKey = "[AzLAWorkspaceKey]",
+)
+
+# Variables
+$nicName = $vmName + "nic0"
+$osDiskName = $vmName + "-disk-0"
+$dataDisk1Name = $vmName + "-disk-1"
+$vmLocalAdminUser = "magicadmin"
+$vmLocalAdminSecurePassword = ConvertTo-SecureString "adminpasswordsarebadonpublicwebsites" -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential ($vmLocalAdminUser, $vmLocalAdminSecurePassword);
+
+$createdByUser = (Get-AzContext).Account.Id
+$createdDate = (Get-date -Format "yyyy.MM.dd-HH.mm.ss").ToString();
+
+$Tags = @{
+    "Environment" = $environment
+    "Application" = $AzTagApplication
+    "Description" = $vmDescription
+    "Location"    = $locationName ;
+    "CreatedBy"      = $createdByUser
+    "CreatedDate"    = $createdDate
+}
+
+# Login to Azure if not logged in
+
+$LoggedIn = $false
+$LoggedInContext = (Get-AzContext -ListAvailable).where( {$_.Subscription.Name -eq $subscriptionName}) | Select-Object -First 1
+
+if ($LoggedInContext) {
+    $LoggedIn = $true
+    Write-Verbose "Logged in!"
+} else{
+    #Need to log in
+    $LoggedIn = $false
+    Write-Verbose "Not Logged in!"
+}
+
+#Get our current context
+$azContext = Get-AzContext
+
+if ( (-not ($LoggedIn)) -or (  $null -eq $azContext ) -or (  $null -eq $azContext.Environment ) ) {
+    Write-Host "Logging in..." -ForegroundColor Green
+    $login = Login-AzAccount -Subscription $subscriptionName -TenantId $TenantID -ErrorAction SilentlyContinue
+    if ($null -eq $login) {
+        #Canceled
+        throw "ERROR - You are not logged into -Subscription $Subscription -TenantId $TenantID"
+    }
+}
+
+if ( $azcontext.Subscription.id -eq  $LoggedInContext.Subscription.Id ) {
+    #We're in the right sub, don't do anything else
+    Write-Host "  Context already set to $subscriptionName" -ForegroundColor Cyan
+} else {
+    #Set our subscription using the command line - to allow for 3Cloud Sandbox testing
+    Write-Host "  Setting Subscription to '$subscriptionName' " -ForegroundColor Green
+    Set-AzContext -Subscription $subscriptionName -Tenant $TenantID | Out-Null
+    Write-Host "  Context set to $subscriptionName" -ForegroundColor Cyan
+    $azContext = Get-AzContext
+}
+
+# Validate Prereq's
+
+# Validate Virtual Network exists
+$vnetObj = Get-AzVirtualNetwork -Name $vnetName -ResourceGroupName $vnetRGName -ErrorAction SilentlyContinue
+if ($vnetObj) {
+    Write-Host "    Virtual network '$vnetName' exists" -ForegroundColor Cyan
+} else {
+    throw "Virtual network '$rgName' does not exist in RG '$vnetRGName'"
+}
+
+# Validate Subnet Exists
+$subnetObj = Get-AzVirtualNetworkSubnetConfig -Name $subnetName -VirtualNetwork $vnetObj -ErrorAction SilentlyContinue
+if ($subnetObj) {
+    Write-Host "    Subnet '$subnetName' exists" -ForegroundColor Cyan
+} else {
+    throw "Subnet '$subnetName' does not exist in virtual network '$vnetName'"
+}
+
+# Validate ADE KeyVault Exists
+$adeKeyVaultObj = Get-AzKeyVault -Name $adeKeyVaultName -ResourceGroupName $adeKeyVaultRGName -ErrorAction SilentlyContinue
+if ($adeKeyVaultObj) {
+    Write-Host "    ADE KeyVault '$adeKeyVaultName' exists" -ForegroundColor Cyan
+} else {
+    throw "ADE KeyVault '$adeKeyVaultName' does not exist in RG '$adeKeyVaultRGName'"
+}
+
+# Create Resource Group
+
+$RGObject = Get-AzResourceGroup -Name $rgName -ErrorAction SilentlyContinue
+if ($RGObject) {
+    Write-Host "    Resource group '$rgName' already exists" -ForegroundColor Cyan
+} else {
+    Write-Host "    Creating resource group '$rgName'"  -ForegroundColor Green
+    $RGObject = New-AzResourceGroup -Name $rgName -Location $locationName -Tag $Tags
+    Write-Host "  Successfully created resource group '$rgName'" -ForegroundColor Green
+} 
+
+# Create Nic
+
+$nicObject = Get-AzNetworkInterface -Name $nicName -ResourceGroupName $rgName -ErrorAction SilentlyContinue
+
+if($nicObject) {
+    Write-Host "    Network Interface Card '$nicName' already exists" -ForegroundColor Cyan
+} else {
+    Write-Host "    Creating Network Interface Card '$nicName'"  -ForegroundColor Green
+    $ipConfigObject = New-AzNetworkInterfaceIpConfig -Name "ipconfig1" -Subnet $subnetObj
+    $nicObject = New-AzNetworkInterface -Name $nicName -ResourceGroupName $rgName -Location $locationName -IpConfiguration $ipConfigObject -Tag $Tags
+    Write-Host "  Successfully created Network Interface Card '$nicName'" -ForegroundColor Green
+}
+
+# Create Data Disk
+
+$disk1Object = Get-AzDisk -Name $dataDisk1Name -ResourceGroupName $rgName -ErrorAction SilentlyContinue
+
+if($disk1Object) {
+    Write-Host "    Data Disk '$dataDisk1Name' already exists" -ForegroundColor Cyan
+} else {
+    Write-Host "    Creating Data Disk '$dataDisk1Name'"  -ForegroundColor Green
+    $diskConfigObject = New-AzDiskConfig -SkuName $dataDisk1StorageType -Location $locationName -CreateOption Empty -DiskSizeGB $dataDisk1SizeGB -Zone $vmZone -Tag $Tags
+    $disk1Object = New-AzDisk -DiskName $dataDisk1Name -ResourceGroupName $rgName -Disk $diskConfigObject
+    Write-Host "  Successfully created Data Disk '$dataDisk1Name'" -ForegroundColor Green
+}
+
+# Create VM
+$vmObject = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction SilentlyContinue
+if($vmObject) {
+    Write-Host "    Virtual Machine '$vmName' already exists" -ForegroundColor Cyan
+} else {
+
+    # Create a VM Configuration
+
+    $vmConfigObject = New-AzVMConfig -VMName $vmName -VMSize $vmSku -Zone $vmZone -Tags $Tags
+    $vmConfigObject = Set-AzVMOperatingSystem -VM $vmConfigObject -Windows -ComputerName $vmName -Credential $credential -ProvisionVMAgent -PatchMode Manual -TimeZone $vmTimeZone
+    $vmConfigObject = Add-AzVMNetworkInterface -VM $vmConfigObject -Id $nicObject.Id
+    $vmConfigObject = Set-AzVMSourceImage -VM $vmConfigObject -PublisherName "MicrosoftWindowsServer" -Offer "WindowsServer" -Skus $vmOS -Version latest
+    $vmConfigObject = Set-AzVMOSDisk -VM $vmConfigObject -Name $osDiskName -CreateOption FromImage -DiskSizeInGB $osDiskSize -StorageAccountType $osDiskStorageType
+    $vmConfigObject = Add-AzVMDataDisk -VM $vmConfigObject -Name $dataDisk1Name -CreateOption Attach -ManagedDiskId $disk1Object.Id -lun 1 -Caching ReadWrite
+
+    Write-Host "    Creating Virtual Machine '$vmName'"  -ForegroundColor Green
+    New-AzVM -ResourceGroupName $rgName -Location $locationName -VM $vmConfigObject -Tag $Tags
+    Write-Host "  Successfully created Virtual Machine '$vmName'" -ForegroundColor Green
+}
+
+# Enable ADE on OS Disk
+$adeStatus = Get-AzVMDiskEncryptionStatus -ResourceGroupName $rgName -VMName $vmName -ErrorAction SilentlyContinue
+if ($adeStatus.OsVolumeEncrypted -eq "NotEncrypted") {
+    Write-Host "    Enabling ADE on OS Disk"  -ForegroundColor Green
+    Set-AzVMDiskEncryptionExtension -ResourceGroupName $rgName `
+        -VMName $vmName `
+        -DiskEncryptionKeyVaultUrl $adeKeyVaultObj.VaultUri `
+        -DiskEncryptionKeyVaultId $adeKeyVaultObj.ResourceId `
+        -VolumeType "OS" `
+        -Force | Out-Null
+    Write-Host "  Successfully Enabled ADE on OS Disk" -ForegroundColor Green
+} else {
+    Write-Host "  ADE already enabled on OS Disk" -ForegroundColor Green
+}
+
+# Add to Log Analytics
+$laExtensionStatus = Get-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name "MicrosoftMonitoringAgent" -ErrorAction SilentlyContinue
+if ( $laExtensionStatus.ProvisioningState -ne "Succeeded") {
+    $PublicSettings = @{"workspaceId" = $logAnalyticsWorkspaceID}
+    $ProtectedSettings = @{"workspaceKey" = $logAnalyticsWorkspaceKey}
+
+    Write-Host "    Enabling Log Analytics Extension"  -ForegroundColor Green
+    Set-AzVMExtension -Name "MicrosoftMonitoringAgent" `
+        -ExtensionType "MicrosoftMonitoringAgent" `
+        -Publisher "Microsoft.EnterpriseCloud.Monitoring" `
+        -TypeHandlerVersion 1.0 `
+        -Settings $PublicSettings `
+        -ProtectedSettings $ProtectedSettings `
+        -ResourceGroupName $rgName `
+        -VMName $vmName `
+        -Location $locationName | Out-Null
+    Write-Host "  Successfully Enabled Log Analytics Extension" -ForegroundColor Green
+} else {
+    Write-Host "  Log Analytics Extension Already Enabled" -ForegroundColor Green
+}
+
+# Install Dependency Agent
+$daExtensionStatus = Get-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name "Microsoft.Azure.Monitoring.DependencyAgent" -ErrorAction SilentlyContinue
+if ( $daExtensionStatus.ProvisioningState -ne "Succeeded") {
+    Write-Host "    Enabling Dependency Agent Extension"  -ForegroundColor Green
+    Set-AzVMExtension -Name "Microsoft.Azure.Monitoring.DependencyAgent" `
+        -ExtensionType "DependencyAgentWindows" `
+        -Publisher "Microsoft.Azure.Monitoring.DependencyAgent" `
+        -TypeHandlerVersion 9.5 `
+        -ResourceGroupName $rgName `
+        -VMName $vmName `
+        -Location $locationName | Out-Null
+    Write-Host "  Successfully Enabled Dependency Agent Extension" -ForegroundColor Green
+} else {
+    Write-Host "  Dependency Agent Extension Already Enabled" -ForegroundColor Green
+}
